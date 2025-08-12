@@ -1,0 +1,234 @@
+{
+  "Comment": "Healthcare Data Processing Pipeline - Complete 4-Stage Workflow",
+  "StartAt": "Stage1_ExtractFacilityMetrics",
+  "States": {
+    "Stage1_ExtractFacilityMetrics": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Parameters": {
+        "QueryString": "SELECT facility_id, facility_name, employee_count, cardinality(services) AS number_of_offered_services, (SELECT MIN(date(accred.valid_until)) FROM UNNEST(accreditations) AS t(accred)) AS expiry_date_of_first_accreditation FROM healthcare_facilities ORDER BY facility_name;",
+        "QueryExecutionContext": {
+          "Database": "healthcare_db"
+        },
+        "ResultConfiguration": {
+          "OutputLocation": "s3://YOUR_BUCKET_NAME/athena-results/stage1/"
+        }
+      },
+      "ResultPath": "$.stage1Result",
+      "Next": "Stage2_FilterExpiringFacilities",
+      "Retry": [
+        {
+          "ErrorEquals": ["Athena.InvalidRequestException", "Athena.TooManyRequestsException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "SendFailureNotification",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "Stage2_FilterExpiringFacilities": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Parameters": {
+        "QueryString": "SELECT DISTINCT facility_id, facility_name, location, employee_count, services, labs, accreditations FROM healthcare_facilities CROSS JOIN UNNEST(accreditations) AS t(accred) WHERE date(accred.valid_until) BETWEEN current_date AND date_add('month', 6, current_date) ORDER BY facility_name;",
+        "QueryExecutionContext": {
+          "Database": "healthcare_db"
+        },
+        "ResultConfiguration": {
+          "OutputLocation": "s3://YOUR_BUCKET_NAME/athena-results/stage2/"
+        }
+      },
+      "ResultPath": "$.stage2Result",
+      "Next": "Stage3_ProcessWithLambda",
+      "Retry": [
+        {
+          "ErrorEquals": ["Athena.InvalidRequestException", "Athena.TooManyRequestsException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "SendFailureNotification",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "Stage3_ProcessWithLambda": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "healthcare-processor",
+        "Payload": {
+          "bucket_name": "YOUR_BUCKET_NAME",
+          "object_key": "healthcare-data/facilities/",
+          "trigger_source": "step_functions",
+          "stage": "process_and_count"
+        }
+      },
+      "ResultPath": "$.stage3Result",
+      "Next": "Stage4_CountFacilitiesByState",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "SendFailureNotification",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "Stage4_CountFacilitiesByState": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Parameters": {
+        "QueryString": "SELECT location.state, COUNT(*) AS accredited_facilities_count FROM healthcare_facilities WHERE cardinality(accreditations) > 0 GROUP BY location.state ORDER BY accredited_facilities_count DESC;",
+        "QueryExecutionContext": {
+          "Database": "healthcare_db"
+        },
+        "ResultConfiguration": {
+          "OutputLocation": "s3://YOUR_BUCKET_NAME/athena-results/stage4/"
+        }
+      },
+      "ResultPath": "$.stage4Result",
+      "Next": "CheckAllStagesComplete",
+      "Retry": [
+        {
+          "ErrorEquals": ["Athena.InvalidRequestException", "Athena.TooManyRequestsException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "SendFailureNotification",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "CheckAllStagesComplete": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.stage1Result.QueryExecution.Status.State",
+              "StringEquals": "SUCCEEDED"
+            },
+            {
+              "Variable": "$.stage2Result.QueryExecution.Status.State",
+              "StringEquals": "SUCCEEDED"
+            },
+            {
+              "Variable": "$.stage3Result.Payload.statusCode",
+              "NumericEquals": 200
+            },
+            {
+              "Variable": "$.stage4Result.QueryExecution.Status.State",
+              "StringEquals": "SUCCEEDED"
+            }
+          ],
+          "Next": "CopyResultsToProduction"
+        }
+      ],
+      "Default": "SendFailureNotification"
+    },
+
+    "CopyResultsToProduction": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "CopyStage1Results",
+          "States": {
+            "CopyStage1Results": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:s3:copyObject",
+              "Parameters": {
+                "Bucket": "YOUR_BUCKET_NAME",
+                "CopySource.$": "States.Format('YOUR_BUCKET_NAME/athena-results/stage1/{}.csv', $.stage1Result.QueryExecution.QueryExecutionId)",
+                "Key.$": "States.Format('production/stage1-facility-metrics-{}.csv', $$.State.EnteredTime)"
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "CopyStage4Results",
+          "States": {
+            "CopyStage4Results": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:s3:copyObject",
+              "Parameters": {
+                "Bucket": "YOUR_BUCKET_NAME",
+                "CopySource.$": "States.Format('YOUR_BUCKET_NAME/athena-results/stage4/{}.csv', $.stage4Result.QueryExecution.QueryExecutionId)",
+                "Key.$": "States.Format('production/stage4-facilities-by-state-{}.csv', $$.State.EnteredTime)"
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultPath": "$.copyResults",
+      "Next": "SendSuccessNotification",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "SendFailureNotification",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "SendSuccessNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:REGION:ACCOUNT_ID:healthcare-accreditation-medium",
+        "Subject": "Healthcare Pipeline - All 4 Stages Completed Successfully",
+        "Message.$": "States.Format('Healthcare data processing pipeline completed successfully at {}. All 4 stages executed: Stage1 (Extract Metrics), Stage2 (Filter 6-Month Expiring), Stage3 (Lambda Processing), Stage4 (Count by State). Results copied to production.', $$.State.EnteredTime)"
+      },
+      "Next": "PipelineSuccess"
+    },
+
+    "SendFailureNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:REGION:ACCOUNT_ID:healthcare-accreditation-critical",
+        "Subject": "Healthcare Pipeline - FAILURE",
+        "Message.$": "States.Format('Healthcare data pipeline failed at {}. Error details: {}', $$.State.EnteredTime, $.error.Cause)"
+      },
+      "Next": "PipelineFailure"
+    },
+
+    "PipelineSuccess": {
+      "Type": "Succeed",
+      "Comment": "All 4 stages of healthcare data processing completed successfully"
+    },
+
+    "PipelineFailure": {
+      "Type": "Fail",
+      "Comment": "Healthcare data processing pipeline failed"
+    }
+  }
+}

@@ -1,0 +1,365 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Healthcare Facility Data Processing Infrastructure'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'healthcare-data-pipeline'
+    Description: 'Name of the project for resource naming'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name'
+  
+  NotificationEmail:
+    Type: String
+    Description: 'Email address for notifications'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+Resources:
+  # S3 Buckets
+  HealthcareDataBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ProjectName}-data-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: 'ArchiveOldData'
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_INFREQUENT_ACCESS
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+
+  HealthcareResultsBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ProjectName}-results-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  HealthcareReportsBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ProjectName}-reports-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # IAM Roles
+  HealthcareLambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'HealthcareDataAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub '${HealthcareDataBucket}/*'
+                  - !GetAtt HealthcareDataBucket.Arn
+                  - !Sub '${HealthcareResultsBucket}/*'
+                  - !GetAtt HealthcareResultsBucket.Arn
+                  - !Sub '${HealthcareReportsBucket}/*'
+                  - !GetAtt HealthcareReportsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - 'athena:StartQueryExecution'
+                  - 'athena:GetQueryExecution'
+                  - 'athena:GetQueryResults'
+                  - 'athena:StopQueryExecution'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'glue:GetTable'
+                  - 'glue:GetPartitions'
+                  - 'glue:GetDatabase'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref HealthcareNotificationTopic
+
+  StepFunctionsExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${ProjectName}-stepfunctions-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'StepFunctionsExecutionPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-*'
+              - Effect: Allow
+                Action:
+                  - 'athena:StartQueryExecution'
+                  - 'athena:StopQueryExecution'
+                  - 'athena:GetQueryExecution'
+                  - 'athena:GetQueryResults'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                Resource:
+                  - !Sub '${HealthcareResultsBucket}/*'
+                  - !Sub '${HealthcareReportsBucket}/*'
+
+  # Lambda Functions
+  HealthcareProcessorFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-processor-${Environment}'
+      Runtime: python3.9
+      Handler: healthcare_processor.lambda_handler
+      Role: !GetAtt HealthcareLambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref HealthcareDataBucket
+          RESULTS_BUCKET: !Ref HealthcareResultsBucket
+          NOTIFICATION_TOPIC: !Ref HealthcareNotificationTopic
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Healthcare processor placeholder')
+              }
+
+  InputValidatorFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-input-validator-${Environment}'
+      Runtime: python3.9
+      Handler: input_validator.lambda_handler
+      Role: !GetAtt HealthcareLambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'isValid': True})
+              }
+
+  # SNS Topic for Notifications
+  HealthcareNotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications-${Environment}'
+      DisplayName: 'Healthcare Accreditation Notifications'
+
+  HealthcareNotificationSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: email
+      TopicArn: !Ref HealthcareNotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # Athena WorkGroup
+  HealthcareAthenaWorkGroup:
+    Type: 'AWS::Athena::WorkGroup'
+    Properties:
+      Name: !Sub '${ProjectName}-workgroup-${Environment}'
+      Description: 'Athena WorkGroup for Healthcare Data Processing'
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${HealthcareResultsBucket}/athena-results/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetrics: true
+
+  # Glue Database
+  HealthcareGlueDatabase:
+    Type: 'AWS::Glue::Database'
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_database_${Environment}'
+        Description: 'Database for healthcare facility data'
+
+  # Step Functions State Machine
+  HealthcareStateMachine:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-pipeline-${Environment}'
+      DefinitionString: !Sub |
+        {
+          "Comment": "Healthcare Facility Data Processing Pipeline",
+          "StartAt": "ProcessHealthcareData",
+          "States": {
+            "ProcessHealthcareData": {
+              "Type": "Task",
+              "Resource": "${HealthcareProcessorFunction.Arn}",
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+
+  # EventBridge Rule for Daily Processing
+  DailyProcessingRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: !Sub '${ProjectName}-daily-processing-${Environment}'
+      Description: 'Trigger healthcare data processing daily'
+      ScheduleExpression: 'cron(0 8 * * ? *)'  # 8 AM UTC daily
+      State: ENABLED
+      Targets:
+        - Arn: !Ref HealthcareStateMachine
+          Id: 'HealthcareStateMachineTarget'
+          RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+
+  # CloudWatch Dashboard
+  HealthcareDashboard:
+    Type: 'AWS::CloudWatch::Dashboard'
+    Properties:
+      DashboardName: !Sub '${ProjectName}-dashboard-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${HealthcareProcessorFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Invocations", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/States", "ExecutionSucceeded", "StateMachineArn", "${HealthcareStateMachine}" ],
+                  [ ".", "ExecutionFailed", ".", "." ],
+                  [ ".", "ExecutionsStarted", ".", "." ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Step Functions Executions"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  DataBucketName:
+    Description: 'Name of the S3 bucket for healthcare data'
+    Value: !Ref HealthcareDataBucket
+    Export:
+      Name: !Sub '${ProjectName}-DataBucket-${Environment}'
+
+  ResultsBucketName:
+    Description: 'Name of the S3 bucket for processing results'
+    Value: !Ref HealthcareResultsBucket
+    Export:
+      Name: !Sub '${ProjectName}-ResultsBucket-${Environment}'
+
+  ReportsBucketName:
+    Description: 'Name of the S3 bucket for reports'
+    Value: !Ref HealthcareReportsBucket
+    Export:
+      Name: !Sub '${ProjectName}-ReportsBucket-${Environment}'
+
+  StateMachineArn:
+    Description: 'ARN of the Step Functions state machine'
+    Value: !Ref HealthcareStateMachine
+    Export:
+      Name: !Sub '${ProjectName}-StateMachine-${Environment}'
+
+  NotificationTopicArn:
+    Description: 'ARN of the SNS notification topic'
+    Value: !Ref HealthcareNotificationTopic
+    Export:
+      Name: !Sub '${ProjectName}-NotificationTopic-${Environment}'
+
+  AthenaWorkGroupName:
+    Description: 'Name of the Athena WorkGroup'
+    Value: !Ref HealthcareAthenaWorkGroup
+    Export:
+      Name: !Sub '${ProjectName}-AthenaWorkGroup-${Environment}'
+
+  GlueDatabaseName:
+    Description: 'Name of the Glue Database'
+    Value: !Ref HealthcareGlueDatabase
+    Export:
+      Name: !Sub '${ProjectName}-GlueDatabase-${Environment}'
