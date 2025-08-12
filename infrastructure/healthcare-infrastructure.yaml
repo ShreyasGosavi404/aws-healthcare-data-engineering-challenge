@@ -15,6 +15,7 @@ Parameters:
   
   NotificationEmail:
     Type: String
+    Default: 'admin@example.com'
     Description: 'Email address for notifications'
     AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
 
@@ -81,7 +82,6 @@ Resources:
   HealthcareLambdaExecutionRole:
     Type: 'AWS::IAM::Role'
     Properties:
-      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -129,7 +129,6 @@ Resources:
   StepFunctionsExecutionRole:
     Type: 'AWS::IAM::Role'
     Properties:
-      RoleName: !Sub '${ProjectName}-stepfunctions-execution-role-${Environment}'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -160,6 +159,26 @@ Resources:
                 Resource:
                   - !Sub '${HealthcareResultsBucket}/*'
                   - !Sub '${HealthcareReportsBucket}/*'
+
+  EventBridgeRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'StepFunctionsExecutionPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-pipeline-${Environment}'
 
   # Lambda Functions
   HealthcareProcessorFunction:
@@ -272,7 +291,7 @@ Resources:
       Targets:
         - Arn: !Ref HealthcareStateMachine
           Id: 'HealthcareStateMachineTarget'
-          RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+          RoleArn: !GetAtt EventBridgeRole.Arn
 
   # CloudWatch Dashboard
   HealthcareDashboard:
