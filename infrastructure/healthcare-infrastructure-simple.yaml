@@ -1,0 +1,198 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simplified Healthcare Analytics Infrastructure - Core Components Only'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'healthcare-pipeline'
+    Description: 'Name of the project for resource naming'
+  
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name'
+
+Resources:
+  # S3 Bucket for Data Storage
+  HealthcareDataBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ProjectName}-data-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # S3 Bucket for Results
+  HealthcareResultsBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ProjectName}-results-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # SNS Topic for Notifications
+  HealthcareNotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: !Sub '${ProjectName}-notifications-${Environment}'
+      DisplayName: 'Healthcare Accreditation Notifications'
+
+  # IAM Role for Lambda
+  HealthcareLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'HealthcareDataAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub '${HealthcareDataBucket}/*'
+                  - !GetAtt HealthcareDataBucket.Arn
+                  - !Sub '${HealthcareResultsBucket}/*'
+                  - !GetAtt HealthcareResultsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref HealthcareNotificationTopic
+
+  # IAM Role for Step Functions
+  StepFunctionsRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'StepFunctionsPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'athena:StartQueryExecution'
+                  - 'athena:StopQueryExecution'
+                  - 'athena:GetQueryExecution'
+                  - 'athena:GetQueryResults'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:CopyObject'
+                Resource:
+                  - !Sub '${HealthcareResultsBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 'glue:GetDatabase'
+                  - 'glue:GetTable'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref HealthcareNotificationTopic
+
+  # Glue Database
+  HealthcareDatabase:
+    Type: 'AWS::Glue::Database'
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_db_${Environment}'
+        Description: 'Database for healthcare facility data'
+
+  # Athena WorkGroup
+  HealthcareWorkGroup:
+    Type: 'AWS::Athena::WorkGroup'
+    Properties:
+      Name: !Sub '${ProjectName}-workgroup-${Environment}'
+      Description: 'Athena WorkGroup for Healthcare Data Processing'
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${HealthcareResultsBucket}/athena-results/'
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetrics: true
+
+Outputs:
+  DataBucketName:
+    Description: 'Name of the S3 bucket for healthcare data'
+    Value: !Ref HealthcareDataBucket
+    Export:
+      Name: !Sub '${ProjectName}-DataBucket-${Environment}'
+
+  ResultsBucketName:
+    Description: 'Name of the S3 bucket for processing results'
+    Value: !Ref HealthcareResultsBucket
+    Export:
+      Name: !Sub '${ProjectName}-ResultsBucket-${Environment}'
+
+  NotificationTopicArn:
+    Description: 'ARN of the SNS notification topic'
+    Value: !Ref HealthcareNotificationTopic
+    Export:
+      Name: !Sub '${ProjectName}-NotificationTopic-${Environment}'
+
+  LambdaRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt HealthcareLambdaRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-LambdaRole-${Environment}'
+
+  StepFunctionsRoleArn:
+    Description: 'ARN of the Step Functions execution role'
+    Value: !GetAtt StepFunctionsRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-StepFunctionsRole-${Environment}'
+
+  DatabaseName:
+    Description: 'Name of the Glue Database'
+    Value: !Ref HealthcareDatabase
+    Export:
+      Name: !Sub '${ProjectName}-Database-${Environment}'
+
+  WorkGroupName:
+    Description: 'Name of the Athena WorkGroup'
+    Value: !Ref HealthcareWorkGroup
+    Export:
+      Name: !Sub '${ProjectName}-WorkGroup-${Environment}'
