@@ -7,7 +7,6 @@ facilities with expiring accreditations.
 
 import json
 import boto3
-import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, List, Any
 import logging
@@ -96,10 +95,11 @@ def process_healthcare_data(bucket_name: str, object_key: str) -> List[Dict[str,
         # Process each JSON file
         for obj in response['Contents']:
             if obj['Key'].endswith('.json'):
-                facility_data = load_facility_data(bucket_name, obj['Key'])
-                if facility_data:
-                    processed_data = enrich_facility_data(facility_data)
-                    processed_facilities.append(processed_data)
+                facilities_list = load_facility_data(bucket_name, obj['Key'])
+                for facility_data in facilities_list:
+                    if facility_data:
+                        processed_data = enrich_facility_data(facility_data)
+                        processed_facilities.append(processed_data)
         
         logger.info(f"Processed {len(processed_facilities)} facilities")
         return processed_facilities
@@ -108,25 +108,48 @@ def process_healthcare_data(bucket_name: str, object_key: str) -> List[Dict[str,
         logger.error(f"Error processing healthcare data: {str(e)}")
         raise
 
-def load_facility_data(bucket_name: str, object_key: str) -> Dict[str, Any]:
+def load_facility_data(bucket_name: str, object_key: str) -> List[Dict[str, Any]]:
     """
-    Load facility data from S3 JSON file
+    Load facility data from S3 JSON file (supports NDJSON format)
     
     Args:
         bucket_name: S3 bucket name
         object_key: S3 object key
         
     Returns:
-        Parsed facility data or empty dict if error
+        List of parsed facility records or empty list if error
     """
     try:
         response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
         content = response['Body'].read().decode('utf-8')
-        return json.loads(content)
+        
+        facilities = []
+        
+        # Handle NDJSON format (multiple JSON objects on separate lines)
+        for line in content.strip().split('\n'):
+            if line.strip():  # Skip empty lines
+                try:
+                    facility = json.loads(line.strip())
+                    facilities.append(facility)
+                except json.JSONDecodeError as json_error:
+                    logger.warning(f"Failed to parse line in {object_key}: {line[:100]}... Error: {str(json_error)}")
+                    continue
+        
+        if facilities:
+            logger.info(f"Successfully loaded {len(facilities)} facilities from {object_key}")
+            return facilities
+        else:
+            # Try parsing as single JSON object
+            try:
+                single_facility = json.loads(content)
+                return [single_facility]
+            except json.JSONDecodeError:
+                logger.error(f"Failed to parse {object_key} as either NDJSON or single JSON")
+                return []
         
     except Exception as e:
         logger.error(f"Error loading facility data from {object_key}: {str(e)}")
-        return {}
+        return []
 
 def enrich_facility_data(facility_data: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -276,7 +299,10 @@ def send_sns_notification(subject: str, message: str, priority: str) -> None:
         priority: Priority level
     """
     try:
-        topic_arn = f"arn:aws:sns:us-east-1:123456789012:healthcare-accreditation-{priority}"
+        # Get account ID dynamically
+        sts_client = boto3.client('sts')
+        account_id = sts_client.get_caller_identity()['Account']
+        topic_arn = f"arn:aws:sns:us-east-1:{account_id}:healthcare-accreditation-{priority}"
         
         sns_client.publish(
             TopicArn=topic_arn,
@@ -314,7 +340,7 @@ def format_notification_message(facilities: List[Dict[str, Any]], priority: str)
         
         for accred in facility['expiring_accreditations']:
             if accred['priority'] == priority:
-                message_lines.append(f"  - {accred['accreditation_type']} (expires in {accred['days_to_expiry']} days)")
+                message_lines.append(f"  - {accred['accreditation_body']} (expires in {accred['days_to_expiry']} days)")
         
         message_lines.append("")
     
