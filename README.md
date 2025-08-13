@@ -15,7 +15,6 @@ This project implements a **4-stage automated data pipeline**:
 ```
 AWS Challenge/
 ├── 📄 README.md                           # Project documentation
-├── 📄 FIXES_AND_DEPLOYMENT.md            # Deployment notes and fixes
 ├── 📄 sample_healthcare_facility.json     # Test data (NDJSON format)
 ├── 📁 athena/
 │   ├── 📁 queries/
